@@ -188,7 +188,7 @@ class SC2MultimodalEnv(gym.Env):
             'image': spaces.Box(
                 low=0,
                 high=255,
-                shape=(*self.rgb_dims, 3),
+                shape=(self.rgb_dims[1], self.rgb_dims[0], 3),
                 dtype=np.uint8
             ),
             'unit_info': unit_info_space
