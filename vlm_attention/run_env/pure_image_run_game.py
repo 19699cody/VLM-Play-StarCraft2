@@ -8,7 +8,11 @@ import cv2
 
 from vlm_attention.env.env_core import SC2MultimodalEnv
 from vlm_attention import ROOT_DIR, CONFIG_FILE_RELATIVE_PATH
-from vlm_attention.vlm.gemini_vlm import GeminiVLM
+from vlm_attention.vlm.gemini_vlm import (
+    GeminiVLM,
+    AGGRESSIVE_PERSONALITY,
+    PASSIVE_PERSONALITY
+)
 
 
 """
@@ -31,7 +35,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string(
     "map",
-    "3s_vs_3z_vlm_attention",
+    "vlm_attention_2vAI",
     "Name of the map to use"
 )
 
@@ -63,7 +67,15 @@ class PureImageAgent:
         self.step_count = 0
 
         # Gemini VLM
-        self.vlm = GeminiVLM()
+        # Player 1: Aggressive Gemini commander
+        self.gemini_player_1 = GeminiVLM(
+        personality=AGGRESSIVE_PERSONALITY
+        )
+
+        # Player 2: Passive Gemini commander
+        self.gemini_player_2 = GeminiVLM(
+        personality=PASSIVE_PERSONALITY
+        )
 
         os.makedirs(self.screenshot_dir, exist_ok=True)
 
@@ -78,9 +90,9 @@ class PureImageAgent:
                 observation
             )
 
-            decision = self.vlm.decide(
-                screenshot_path=screenshot_path,
-                unit_info=observation["unit_info"]
+            decision = self.gemini_player_1.decide(
+                screenshot_path,
+                observation["unit_info"]
             )
 
             print("\n" + "=" * 60)
@@ -466,7 +478,7 @@ class PureImageAgent:
         }
 
 
-def run_episode(env, agent, max_steps=300):
+def run_episode(env, agent, max_steps=100):
 
     observation = env.reset()
 
@@ -512,13 +524,13 @@ def main(argv):
     )
 
     env = SC2MultimodalEnv(
-        map_name=FLAGS.map,
-        save_dir=save_dir,
-        replay_dir=replay_dir,
-        timestamp=timestamp,
-        feature_dims=(256, 256),
-        rgb_dims=(1920, 1080),
-        map_size=(64, 64)
+    map_name=FLAGS.map,
+    save_dir=save_dir,
+    replay_dir=replay_dir,
+    timestamp=timestamp,
+    feature_dims=(256, 256),
+    rgb_dims=(1280, 720),
+    map_size=(64, 64)
     )
 
     agent = PureImageAgent(
@@ -527,23 +539,24 @@ def main(argv):
 
     num_episodes = 1
 
-    for episode in range(num_episodes):
+    try:
+        for episode in range(num_episodes):
 
-        print(
-            f"\nStarting Episode {episode + 1}"
-        )
+            print(
+                f"\nStarting Episode {episode + 1}"
+            )
 
-        total_reward = run_episode(
-            env,
-            agent
-        )
+            total_reward = run_episode(
+                env,
+                agent
+            )
 
-        print(
-            f"Episode {episode + 1} finished. "
-            f"Total Reward: {total_reward}"
-        )
-
-    env.close()
+            print(
+                f"Episode {episode + 1} finished. "
+                f"Total Reward: {total_reward}"
+            )
+    finally:
+        env.close()
 
 
 if __name__ == "__main__":
