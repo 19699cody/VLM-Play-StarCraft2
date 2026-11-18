@@ -493,9 +493,15 @@ class Multimodal_bot(base_agent.BaseAgent):
 
         # 获取RGB屏幕图像
         if 'rgb_screen' in obs.observation:
-            frame = np.array(obs.observation['rgb_screen'], dtype=np.uint8)
+            frame = np.asarray(
+            obs.observation['rgb_screen'],
+            dtype=np.uint8
+        )
         else:
-            frame = np.zeros((*self.image_size, 3), dtype=np.uint8)
+            frame = np.zeros(
+                (self.image_size[1], self.image_size[0], 3),
+                dtype=np.uint8
+        )
 
         # 收集单位信息
         unit_info = []
