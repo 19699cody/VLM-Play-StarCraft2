@@ -150,8 +150,15 @@ class GeminiVLM:
         game_state = self.format_unit_info(unit_info)
 
         prompt = f"""
-        {self.personality}
-You are controlling a small StarCraft II micromanagement scenario.
+            {self.personality}
+        You are controlling ONLY your own squad of Marines in a
+        StarCraft II team scenario.
+
+        Another Gemini commander independently controls a separate
+        friendly squad. You must not issue commands for that squad.
+
+        Your decisions should account for your teammate's presence,
+        but you are responsible only for your own units.
 
 Use BOTH:
 1. The screenshot
