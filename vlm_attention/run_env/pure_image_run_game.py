@@ -51,31 +51,55 @@ flags.DEFINE_string(
     "Path to the configuration file"
 )
 
+# Gemini player configuration for each map.
+# Marine counts in map names do not determine player counts.
+MAP_CONFIGS = {
+    "vlm_3v3_marines": {
+        "gemini_players": 1
+    },
+    "vlm_attention_2vAI": {
+        "gemini_players": 2
+    }
+}
 
 class PureImageAgent:
 
-    def __init__(self, action_space):
+    def __init__(self, action_space, map_name):
 
         self.action_space = action_space
+        self.map_name = map_name
+
+        # Determine the number of Gemini-controlled players.
+        # Unlisted maps retain the existing single-Gemini behavior.
+        map_config = MAP_CONFIGS.get(
+            map_name,
+            {"gemini_players": 1}
+        )
+
+        self.gemini_player_count = map_config["gemini_players"]
 
         # Keep screenshot saving for the assignment.
         self.screenshot_dir = "./pure_screenshots"
         self.screenshot_count = 0
+        self.observation_count = 0
 
         # Ask the VLM every 10 environment steps.
         self.observation_interval = 10
         self.step_count = 0
 
-        # Gemini VLM
         # Player 1: Aggressive Gemini commander
         self.gemini_player_1 = GeminiVLM(
-        personality=AGGRESSIVE_PERSONALITY
+            personality=AGGRESSIVE_PERSONALITY
         )
 
         # Player 2: Passive Gemini commander
-        self.gemini_player_2 = GeminiVLM(
-        personality=PASSIVE_PERSONALITY
-        )
+        # Only initialize when the selected map requires two Gemini players.
+        self.gemini_player_2 = None
+
+        if self.gemini_player_count >= 2:
+            self.gemini_player_2 = GeminiVLM(
+                personality=PASSIVE_PERSONALITY
+            )
 
         os.makedirs(self.screenshot_dir, exist_ok=True)
 
@@ -83,74 +107,136 @@ class PureImageAgent:
 
         self.step_count += 1
 
-        # Ask Gemini periodically.
-        if self.step_count % self.observation_interval == 0:
-
-            screenshot_path = self.capture_observation(
-                observation
-            )
-
-            decision = self.gemini_player_1.decide(
-                screenshot_path,
-                observation["unit_info"]
-            )
-
-            print("\n" + "=" * 60)
-            print("VLM DECISION")
-            print("=" * 60)
-            print(f"Command: {decision['command']}")
-            print(f"Reason:  {decision['reason']}")
-            print("=" * 60)
-
-            action = self.command_to_action(
-                decision["command"],
-                observation["unit_info"]
-            )
-
-            print("SC2 ACTION")
-            print("=" * 60)
-            print(action)
-            print("=" * 60)
-
-            return action
-
-        # Between VLM decisions, do nothing.
-        return {
+        # Prepare an empty action for each Gemini player.
+        empty_action = {
             "attack": [],
             "move": []
         }
 
-    def capture_observation(self, observation):
+        if self.gemini_player_count == 1:
+            observations = [observation]
+            gemini_players = [self.gemini_player_1]
+        else:
+            observations = observation
+            gemini_players = [
+                self.gemini_player_1,
+                self.gemini_player_2
+            ]
 
-        self.screenshot_count += 1
+        # Between VLM decisions, do nothing.
+        if self.step_count % self.observation_interval != 0:
 
-        # Save the RGB screenshot with the correct color channels.
-        frame = observation["image"]
-        filename = os.path.join(
-            self.screenshot_dir,
-            f"observation_{self.screenshot_count:04d}.png"
+            if self.gemini_player_count == 1:
+                return empty_action
+
+            return [
+                empty_action.copy()
+                for _ in gemini_players
+            ]
+
+        decisions = []
+        actions = []
+        screenshot_paths = []
+
+        # Each Gemini player receives its own observation.
+        for index, (gemini, player_observation) in enumerate(
+            zip(gemini_players, observations)
+        ):
+
+            screenshot_path = self.capture_observation(
+                player_observation,
+                save_screenshot=(index == 0)
+            )
+
+            screenshot_paths.append(screenshot_path)
+
+            decision = gemini.decide(
+                screenshot_path,
+                player_observation["unit_info"]
+            )
+
+            decisions.append(decision)
+
+            action = self.command_to_action(
+                decision["command"],
+                player_observation["unit_info"]
+            )
+
+            actions.append(action)
+
+        # Display both observations together.
+        self.display_observation(
+            observations,
+            screenshot_paths
         )
 
-        cv2.imwrite(
-            filename,
-            cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        )
-
-        # Convert unit information into readable text.
-        game_state = self.format_unit_info(
-            observation["unit_info"]
-        )
-
+        # Display both decisions together.
         print("\n" + "=" * 60)
-        print(f"OBSERVATION #{self.screenshot_count}")
-        print(f"GAME STEP: {self.step_count}")
+        print("VLM DECISIONS")
         print("=" * 60)
 
-        print(game_state)
+        for index, decision in enumerate(decisions):
+
+            personality = (
+                "Aggressive"
+                if index == 0
+                else "Passive"
+            )
+
+            print(f"\nPlayer {index + 1} ({personality}):")
+            print(f"Command: {decision['command']}")
+            print(f"Reason:  {decision['reason']}")
 
         print("=" * 60)
-        print(f"Screenshot saved: {filename}")
+
+        # Display the actions generated by each player.
+        print("SC2 ACTION")
+
+        for index, action in enumerate(actions):
+
+            print(f"\nPlayer {index + 1}:")
+            print(action)
+
         print("=" * 60)
+
+        # Preserve the original single-player action format.
+        if self.gemini_player_count == 1:
+            return actions[0]
+
+        # Two-player maps return one action per Gemini player.
+        return actions
+
+    def capture_observation(self, observation, save_screenshot=True):
+
+        # Save the screenshot only when requested.
+        frame = observation["image"]
+
+        if save_screenshot:
+
+            self.screenshot_count += 1
+
+            filename = os.path.join(
+                self.screenshot_dir,
+                f"observation_{self.screenshot_count:04d}.png"
+            )
+
+            cv2.imwrite(
+                filename,
+                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            )
+
+            print(f"Screenshot saved: {filename}")
+
+        else:
+            filename = os.path.join(
+                self.screenshot_dir,
+                "temporary_player_2.png"
+            )
+
+            cv2.imwrite(
+                filename,
+                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            )
 
         # Return the screenshot path so Gemini can use it.
         return filename
@@ -195,6 +281,79 @@ class PureImageAgent:
             result += "None visible"
 
         return result
+
+    def format_unit_list(self, units):
+
+        if not units:
+            return "None visible"
+
+        return "\n\n".join(
+            f"{unit['unit_name']} "
+            f"(tag={unit['simplified_tag']})\n"
+            f"  Health: {unit['health']}/{unit['max_health']}\n"
+            f"  Position: {unit['position']}"
+            for unit in units
+        )
+
+    def format_combined_unit_info(self, observations):
+
+        player1_units = [
+            unit for unit in observations[0]["unit_info"]
+            if unit["alliance"] == 1
+        ]
+
+        player2_units = [
+            unit for unit in observations[1]["unit_info"]
+            if unit["alliance"] == 1
+        ]
+
+        # Display the enemy group once, using Player 1's observation.
+        enemy_units = [
+            unit for unit in observations[0]["unit_info"]
+            if unit["alliance"] == 4
+        ]
+
+        result = "PLAYER 1 UNITS (Aggressive):\n"
+        result += self.format_unit_list(player1_units)
+
+        result += "\n\nPLAYER 2 UNITS (Passive):\n"
+        result += self.format_unit_list(player2_units)
+
+        result += "\n\nENEMY UNITS:\n"
+        result += self.format_unit_list(enemy_units)
+
+        return result
+
+    def display_observation(self, observations, screenshot_paths):
+
+        self.observation_count += 1
+
+        print("\n" + "=" * 60)
+        print(f"OBSERVATION #{self.observation_count}")
+        print(f"GAME STEP: {self.step_count}")
+        print("=" * 60)
+
+        if self.gemini_player_count == 1:
+
+            print(self.format_unit_info(
+                observations[0]["unit_info"]
+            ))
+
+        else:
+
+            print(self.format_combined_unit_info(observations))
+
+        print("=" * 60)
+
+        for index, path in enumerate(screenshot_paths):
+
+            if index == 0:
+                print(f"Player 1 screenshot saved: {path}")
+
+            else:
+                print("Player 2 screenshot used for Gemini (not retained as a numbered screenshot).")
+
+        print("=" * 60)
 
     def command_to_action(self, command, unit_info):
 
@@ -524,17 +683,22 @@ def main(argv):
     )
 
     env = SC2MultimodalEnv(
-    map_name=FLAGS.map,
-    save_dir=save_dir,
-    replay_dir=replay_dir,
-    timestamp=timestamp,
-    feature_dims=(256, 256),
-    rgb_dims=(1280, 720),
-    map_size=(64, 64)
+        map_name=FLAGS.map,
+        save_dir=save_dir,
+        replay_dir=replay_dir,
+        timestamp=timestamp,
+        feature_dims=(256, 256),
+        rgb_dims=(1280, 720),
+        map_size=(64, 64),
+        gemini_player_count=MAP_CONFIGS.get(
+            FLAGS.map,
+            {"gemini_players": 1}
+        )["gemini_players"]
     )
 
     agent = PureImageAgent(
-        env.action_space
+        env.action_space,
+        FLAGS.map
     )
 
     num_episodes = 1
