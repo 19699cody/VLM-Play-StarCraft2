@@ -36,7 +36,8 @@ class SC2MultimodalEnv(gym.Env):
     }
 
     def __init__(self, map_name, save_dir, replay_dir, timestamp,
-                 feature_dims=None, rgb_dims=None, map_size=None):
+            feature_dims=None, rgb_dims=None, map_size=None,
+            gemini_player_count=1):
         super(SC2MultimodalEnv, self).__init__()
 
         # 验证必要的参数
@@ -56,6 +57,7 @@ class SC2MultimodalEnv(gym.Env):
         self.save_dir = save_dir
         self.replay_dir = replay_dir
         self.timestamp = timestamp
+        self.gemini_player_count = gemini_player_count
         self.sc2_env = None
         self.bot = None
         self.consecutive_errors = 0
@@ -304,11 +306,26 @@ class SC2MultimodalEnv(gym.Env):
                     random_delay = random.uniform(0, retry_delay * (attempt + 1))
                     time.sleep(random_delay)
                     logger.info(f"Retry attempt {attempt + 1} after {random_delay:.2f}s delay")
+               
+                # Create one Terran Agent for each Gemini-controlled player.
+                players = [
+                    sc2_env.Agent(sc2_env.Race.terran)
+                    for _ in range(self.gemini_player_count)
+                ]
+
+                # Preserve the original Bot opponent for single-Gemini maps.
+                # The two-Gemini map will rely on its SCEditor configuration.
+                if self.gemini_player_count == 1:
+                    players.append(
+                        sc2_env.Bot(
+                            sc2_env.Race.random,
+                            sc2_env.Difficulty.easy
+                        )
+                    )
 
                 env = sc2_env.SC2Env(
                     map_name=self.map_name,
-                    players=[sc2_env.Agent(sc2_env.Race.terran),
-                             sc2_env.Bot(sc2_env.Race.random, sc2_env.Difficulty.easy)],
+                    players=players,
                     agent_interface_format=agent_interface_format,
                     step_mul=8,
                     game_steps_per_episode=1000,
@@ -344,69 +361,100 @@ class SC2MultimodalEnv(gym.Env):
         except Exception as e:
             logger.error(f"Error saving replay: {str(e)}")
 
+    
+    
     def step(self, action):
-        """单步执行"""
+        """Execute one environment step for one or more Gemini players."""
         try:
-            # 设置机器人的动作命令
-            try:
-                self.bot.attack_commands = action.get('attack', [])
-                self.bot.original_move_commands = []
-                self.bot.smac_move_commands = []
-                for move_command in action.get('move', []):
+            # Prepare one action dictionary for each Gemini-controlled player.
+            if self.gemini_player_count == 1:
+                player_actions = [action]
+            else:
+                if not isinstance(action, (list, tuple)):
+                    raise ValueError(
+                        "Multiple Gemini players require a list of actions."
+                    )
+
+                if len(action) != self.gemini_player_count:
+                    raise ValueError(
+                        f"Expected {self.gemini_player_count} player actions, "
+                        f"received {len(action)}."
+                    )
+
+                player_actions = action
+
+            # Set each Gemini bot's individual action commands.
+            for bot, player_action in zip(self.bots, player_actions):
+                bot.attack_commands = player_action.get('attack', [])
+                bot.original_move_commands = []
+                bot.smac_move_commands = []
+
+                for move_command in player_action.get('move', []):
                     if len(move_command) == 3:
                         move_type, unit_index, move_target = move_command
+
                         if move_type == 0:
                             continue
-                        elif move_type == 1:  # 原始移动
-                            self.bot.original_move_commands.append((unit_index, tuple(move_target)))
-                        elif move_type == 2:  # SMAC移动
-                            self.bot.smac_move_commands.append((unit_index, move_target[0]))
+                        elif move_type == 1:
+                            bot.original_move_commands.append(
+                                (unit_index, tuple(move_target))
+                            )
+                        elif move_type == 2:
+                            bot.smac_move_commands.append(
+                                (unit_index, move_target[0])
+                            )
                         else:
-                            raise ValueError(f"Invalid move type: {move_type}")
-            except Exception as e:
-                return None, 0, True, {"error": f"Bot command setting error: {str(e)}"}
+                            raise ValueError(
+                                f"Invalid move type: {move_type}"
+                            )
 
-            # 1. 执行空步骤并获取观察
-            obs = self.sc2_env.step([])
+            # Generate actions using each player's latest observation.
+            bot_actions = []
 
-            # 如果已经是最后一步，直接处理结果
-            if obs[0].last():
-                next_state = self._get_observation(obs[0])
-                result_str, result_value = self._get_game_result(obs[0])
-                reward = result_value
-                self.total_reward += reward  # 累积最终奖励
-                info = {
-                    'game_result': result_str,
-                    'game_result_value': result_value,
-                    'total_reward': self.total_reward
-                }
-                self._save_replay_with_result((result_str, result_value))
-                return next_state, result_value, True, info
+            for player_index, bot in enumerate(self.bots):
+                try:
+                    bot_action = bot.step(self._latest_obs[player_index])
+                    bot_actions.append(bot_action)
 
-            # 2. 获取机器人动作
-            try:
-                bot_actions = self.bot.step(obs[0])
-            except Exception as e:
-                return None, 0, True, {"error": f"Bot action error: {str(e)}"}
+                except Exception as e:
+                    return None, 0, True, {
+                        "error": f"Bot action error for Player "
+                                f"{player_index + 1}: {str(e)}"
+                    }
 
-            # 3. 执行动作
-            obs = self.sc2_env.step([bot_actions])
-            next_state = self._get_observation(obs[0])
+            # Execute all Gemini players' actions in one environment step.
+            obs = self.sc2_env.step(bot_actions)
+
+            # Save the latest observations for the next iteration.
+            self._latest_obs = obs
+
+            # Build the next observations.
+            if self.gemini_player_count == 1:
+                next_state = self._get_observation(obs[0], self.bots[0])
+            else:
+                next_state = [
+                    self._get_observation(obs[i], self.bots[i])
+                    for i in range(self.gemini_player_count)
+                ]
+
             done = obs[0].last()
 
             if done:
                 result_str, result_value = self._get_game_result(obs[0])
                 reward = result_value
-                self.total_reward += reward  # 累积最终奖励
+                self.total_reward += reward
+
                 info = {
                     'game_result': result_str,
                     'game_result_value': result_value,
                     'total_reward': self.total_reward
                 }
+
                 self._save_replay_with_result((result_str, result_value))
+
             else:
                 reward = 0
-                self.total_reward += reward  # 累积过程中的奖励(这里都是0)
+                self.total_reward += reward
                 info = {'total_reward': self.total_reward}
 
             return next_state, reward, done, info
@@ -428,27 +476,50 @@ class SC2MultimodalEnv(gym.Env):
             # 创建新环境
             self.sc2_env = self._create_env()
             obs = self.sc2_env.reset()
+            self._latest_obs = obs
 
-            # 重置机器人
-            self.bot = Multimodal_bot(
-                self_color=self.self_color,
-                enemy_color=self.enemy_color,
-                feature_dims=self.feature_dims,
-                rgb_dims=self.rgb_dims,
-                map_size=self.map_size
-            )
-            self.bot.setup(self.sc2_env.observation_spec(), self.sc2_env.action_spec())
-            self.bot.reset()
+            # 为每个 Gemini 控制的玩家分别创建机器人
+            self.bots = []
 
-            # 确保UnitManager的初始化状态被重置
-            self.bot.unit_manager.initialized = False
-            self.bot.unit_manager.tag_registry.clear()
-            self.bot.unit_manager.type_counters.clear()
-            self.bot.unit_manager.next_simplified_tag = 1
+            observation_specs = self.sc2_env.observation_spec()
+            action_specs = self.sc2_env.action_spec()
+
+            for player_index in range(self.gemini_player_count):
+                bot = Multimodal_bot(
+                    self_color=self.self_color,
+                    enemy_color=self.enemy_color,
+                    feature_dims=self.feature_dims,
+                    rgb_dims=self.rgb_dims,
+                    map_size=self.map_size
+                )
+
+                # 为当前玩家提供对应的观察和动作规格
+                bot.setup(
+                    observation_specs[player_index],
+                    action_specs[player_index]
+                )
+                bot.reset()
+
+                # 重置当前机器人的 UnitManager
+                bot.unit_manager.initialized = False
+                bot.unit_manager.tag_registry.clear()
+                bot.unit_manager.type_counters.clear()
+                bot.unit_manager.next_simplified_tag = 1
+
+                self.bots.append(bot)
+
+            # 暂时保留旧的单机器人引用，供现有代码使用
+            self.bot = self.bots[0]
 
             # 重置状态
             self.previous_score = None
-            return self._get_observation(obs[0])
+            if self.gemini_player_count == 1:
+                return self._get_observation(obs[0], self.bots[0])
+
+            return [
+                self._get_observation(obs[i], self.bots[i])
+                for i in range(self.gemini_player_count)
+            ]
 
         except Exception as e:
             logger.error(f"Error during reset: {e}", exc_info=True)
@@ -464,25 +535,40 @@ class SC2MultimodalEnv(gym.Env):
     def __del__(self):
         self.close()
 
-    def _get_observation(self, obs):
-        """获取观察信息"""
+    
+    def _get_observation(self, obs, bot=None):
+        """Get observation information for a specific Gemini player."""
         try:
-            raw_image, unit_info = self.bot.get_raw_image_and_unit_info(obs)
-            text_description = self.bot.get_text_description(obs)
+            # Use the specified player's bot.
+            if bot is None:
+                bot = self.bot
 
-            # 处理单位信息，使用UnitManager中的永久性标识
+            raw_image, unit_info = bot.get_raw_image_and_unit_info(obs)
+            text_description = bot.get_text_description(obs)
+
+            # Process unit information using this bot's UnitManager.
             processed_unit_info = []
 
-            # 按simplified_tag排序，确保顺序一致
-            sorted_units = sorted(unit_info, key=lambda x: x['simplified_tag'])
+            # Sort by simplified_tag to ensure consistent ordering.
+            sorted_units = sorted(
+                unit_info,
+                key=lambda x: x['simplified_tag']
+            )
 
             for unit in sorted_units:
                 original_tag = unit['original_tag']
-                # 从UnitManager获取永久性标识信息
-                _, unit_name = self.bot.unit_manager.tag_registry.get(original_tag, (None, None))
+
+                # Get the permanent unit identifier from this bot's UnitManager.
+                _, unit_name = bot.unit_manager.tag_registry.get(
+                    original_tag,
+                    (None, None)
+                )
 
                 if unit_name is None:
-                    logger.warning(f"Unit with original_tag {original_tag} not found in tag_registry")
+                    logger.warning(
+                        f"Unit with original_tag {original_tag} "
+                        f"not found in tag_registry"
+                    )
                     continue
 
                 unit_data = {
@@ -490,15 +576,16 @@ class SC2MultimodalEnv(gym.Env):
                     'simplified_tag': unit['simplified_tag'],
                     'alliance': unit['alliance'],
                     'unit_type': unit['unit_type'],
-                    'unit_name': unit_name,  # 使用永久性标识中的名称
+                    'unit_name': unit_name,
                     'health': unit['health'],
                     'max_health': unit['max_health'],
                     'shield': unit['shield'],
                     'max_shield': unit['max_shield'],
                     'energy': unit['energy'],
                     'position': unit['position'],
-                    "grid_position":unit["grid_position"]
+                    "grid_position": unit["grid_position"]
                 }
+
                 processed_unit_info.append(unit_data)
 
             return {
@@ -506,6 +593,7 @@ class SC2MultimodalEnv(gym.Env):
                 'image': raw_image,
                 'unit_info': processed_unit_info
             }
+
         except Exception as e:
             logger.error(f"Error in _get_observation: {e}")
             raise
